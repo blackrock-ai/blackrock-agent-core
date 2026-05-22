@@ -5,7 +5,14 @@
   "files": ["migrations"],
   "scripts": {
     "build": "echo 'schema: no build step'",
-    "typecheck": "echo 'schema: no typecheck'"
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@blackrock/agent-runtime": "workspace:*",
+    "@supabase/supabase-js": "^2.45.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0"
   },
   "publishConfig": {
     "registry": "https://npm.pkg.github.com"
