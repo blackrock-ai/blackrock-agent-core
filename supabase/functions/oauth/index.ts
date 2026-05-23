@@ -41,6 +41,11 @@ const SUPPORTED: ReadonlySet<OauthProviderId> = new Set<OauthProviderId>([
   "m365",
 ]);
 
+// account_label is interpolated into Vault secret names by the
+// store_tenant_connection RPC; bound it to a safe set so a hostile caller
+// can't smuggle control characters or path-style separators into the name.
+const ACCOUNT_LABEL = /^[a-zA-Z0-9_.-]{1,64}$/;
+
 function getSupabase() {
   const url = Deno.env.get("SUPABASE_URL");
   const key = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
@@ -88,6 +93,9 @@ async function handleStart(req: Request): Promise<Response> {
   if (!tenantId) return jsonResponse({ error: "tenant_id required" }, 400);
   if (!SUPPORTED.has(providerRaw as OauthProviderId)) {
     return jsonResponse({ error: "unsupported provider" }, 400);
+  }
+  if (!ACCOUNT_LABEL.test(accountLabel)) {
+    return jsonResponse({ error: "invalid account_label" }, 400);
   }
   const provider = providerRaw as OauthProviderId;
 
