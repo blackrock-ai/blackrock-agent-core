@@ -32,6 +32,7 @@
       "name": "@blackrock/agent-core",
       "version": "0.1.0",
       "dependencies": {
+        "@blackrock/agent-runtime": "workspace:*",
         "lucide-react": "^0.383.0",
       },
       "devDependencies": {

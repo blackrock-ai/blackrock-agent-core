@@ -19,6 +19,7 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "@blackrock/agent-runtime": "workspace:*",
     "lucide-react": "^0.383.0"
   },
   "peerDependencies": {

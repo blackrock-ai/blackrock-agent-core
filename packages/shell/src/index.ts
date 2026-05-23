@@ -8,3 +8,9 @@ export type {
   ToolKind,
   NavItem,
 } from "./types";
+export { createAgentClient } from "./client";
+export type {
+  AgentClient,
+  CreateAgentClientOptions,
+  RunInput,
+} from "./client";
