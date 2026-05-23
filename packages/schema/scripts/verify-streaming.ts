@@ -1,4 +1,5 @@
-// Verifies the SSE event schema in packages/runtime/src/events.ts:
+// Verifies the SSE event schema in packages/runtime/src/events.ts AND the
+// run-persistence layer that lands rows in agent_runs / agent_messages:
 //   1. formatSse → parseSseFrame is a faithful round-trip across every
 //      AgentEvent variant.
 //   2. parseSseChunk recovers events even when a sequence of frames is
@@ -8,23 +9,42 @@
 //   4. The client-side asynciterable in @blackrock/agent-core (the shell
 //      package) actually yields the events through its full read loop —
 //      this exercises createAgentClient end-to-end against a stub SSE body.
+//   5. Live-DB persistence: when SUPABASE_URL + SUPABASE_SERVICE_ROLE_KEY
+//      point at a database that has run the Agent Core migration sequence,
+//      recordRunStart + recordMessage + recordToolResults + finalizeRun all
+//      land their rows AND finalizeRun stamps completed_at / status. Parks
+//      if env unset OR the schema isn't applied.
 //
-// Pure offline — no live LLM, no Supabase. Exits 0 on full pass.
+// Invariants 1-4 are pure offline. Invariant 5 is the run-persistence
+// remediation's DB-side check.
+
+import { randomUUID } from 'node:crypto';
 
 import { createAgentClient } from '@blackrock/agent-core';
 import {
+  finalizeRun,
   formatSse,
   parseSseChunk,
   parseSseFrame,
+  recordMessage,
+  recordRunStart,
+  recordToolResults,
   type AgentEvent,
 } from '@blackrock/agent-runtime';
+import { createClient, type SupabaseClient } from '@supabase/supabase-js';
 
 let passes = 0;
 let fails = 0;
+let parked = false;
 
 function ok(invariant: number, detail: string): void {
   process.stdout.write(`[ok] invariant ${invariant} — ${detail}\n`);
   passes += 1;
+}
+
+function park(reason: string): void {
+  parked = true;
+  process.stdout.write(`[parked] ${reason}\n`);
 }
 
 function fail(invariant: number, detail: string): void {
@@ -153,9 +173,145 @@ async function main(): Promise<void> {
     ok(4, `createAgentClient yielded all ${SAMPLES.length} events in order`);
   }
 
-  const summary = `[verify-streaming] ${passes} pass / ${fails} fail`;
+  await checkLivePersistence();
+
+  const tail = parked ? ' (some live checks parked)' : '';
+  const summary = `[verify-streaming] ${passes} pass / ${fails} fail${tail}`;
   process.stdout.write(`${summary}\n`);
   process.exit(fails === 0 ? 0 : 1);
+}
+
+async function checkLivePersistence(): Promise<void> {
+  const url = process.env.SUPABASE_URL;
+  const serviceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  if (!url || !serviceKey) {
+    park('persistence checks — SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY not set');
+    return;
+  }
+
+  const supabase: SupabaseClient = createClient(url, serviceKey, {
+    auth: { persistSession: false },
+  });
+
+  // Confirm the migrations have landed — if `agent_runs` doesn't exist we
+  // can't usefully assert anything about persistence.
+  const { error: probeErr } = await supabase
+    .from('agent_runs')
+    .select('id')
+    .limit(1);
+  if (probeErr) {
+    park(`persistence checks — agent_runs not queryable (${probeErr.message})`);
+    return;
+  }
+
+  // Seed a disposable tenant. Cleaned up in finally — agent_runs cascades.
+  const tenantId = randomUUID();
+  const runId = randomUUID();
+  const slug = `verify-streaming-${runId.slice(0, 8)}`;
+  const { error: tenantErr } = await supabase
+    .from('tenants')
+    .insert({ id: tenantId, slug, display_name: 'verify-streaming' });
+  if (tenantErr) {
+    park(`persistence checks — could not seed tenant (${tenantErr.message})`);
+    return;
+  }
+
+  try {
+    // recordRunStart: agent_runs row + initial user message.
+    const started = await recordRunStart({
+      runId,
+      tenantId,
+      model: 'claude-sonnet-4-5',
+      modelProvider: 'anthropic',
+      userMessage: 'verify-streaming probe',
+    });
+    if (!started) {
+      fail(5, 'recordRunStart returned false');
+      return;
+    }
+    ok(5, 'recordRunStart wrote agent_runs + initial user message');
+
+    // recordMessage: an assistant draft.
+    const drafted = await recordMessage({
+      runId,
+      tenantId,
+      role: 'assistant',
+      content: { kind: 'draft_answer', text: 'probe answer' },
+    });
+    if (!drafted) fail(5, 'recordMessage(assistant draft) returned false');
+    else ok(5, 'recordMessage appended an assistant row');
+
+    // recordToolResults: one fake successful tool.
+    const written = await recordToolResults(runId, tenantId, [
+      {
+        taskId: 't1',
+        tool: 'web_search',
+        ok: true,
+        output: { results: [{ title: 'probe' }] },
+      },
+    ]);
+    if (written !== 1) fail(5, `recordToolResults wrote ${written} rows, expected 1`);
+    else ok(5, 'recordToolResults appended a tool row');
+
+    // finalizeRun: terminal state, tokens stamped.
+    const finalized = await finalizeRun({
+      runId,
+      tenantId,
+      status: 'completed',
+      usage: { tokensIn: 42, tokensOut: 24, cost: 0.0042 },
+      taskGraph: { tasks: [] },
+    });
+    if (!finalized) {
+      fail(5, 'finalizeRun returned false');
+      return;
+    }
+
+    // Verify the row landed as expected.
+    const { data: rows, error: runErr } = await supabase
+      .from('agent_runs')
+      .select('status,tokens_in,tokens_out,cost_estimate,completed_at')
+      .eq('id', runId)
+      .limit(1);
+    if (runErr || !rows || rows.length === 0) {
+      fail(5, `agent_runs read-back failed: ${runErr?.message ?? 'no rows'}`);
+      return;
+    }
+    const r = rows[0] as {
+      status: string;
+      tokens_in: number;
+      tokens_out: number;
+      cost_estimate: number;
+      completed_at: string | null;
+    };
+    if (
+      r.status !== 'completed' ||
+      r.tokens_in !== 42 ||
+      r.tokens_out !== 24 ||
+      !r.completed_at
+    ) {
+      fail(
+        5,
+        `agent_runs terminal state wrong: ${JSON.stringify(r)}`,
+      );
+    } else {
+      ok(5, 'finalizeRun stamped status=completed + tokens + completed_at');
+    }
+
+    const { count: msgCount, error: msgErr } = await supabase
+      .from('agent_messages')
+      .select('id', { count: 'exact', head: true })
+      .eq('run_id', runId);
+    if (msgErr) {
+      fail(5, `agent_messages count failed: ${msgErr.message}`);
+    } else if ((msgCount ?? 0) < 3) {
+      fail(5, `expected at least 3 agent_messages rows, got ${msgCount ?? 0}`);
+    } else {
+      ok(5, `agent_messages has ${msgCount} rows for this run`);
+    }
+  } finally {
+    // Cleanup — cascade from tenants takes care of runs and messages.
+    await supabase.from('tenants').delete().eq('id', tenantId);
+  }
 }
 
 main().catch((err: unknown) => {
