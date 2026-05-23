@@ -4,6 +4,8 @@ import { execute } from "./executor";
 import { synthesize } from "./synthesizer";
 import { critique } from "./critic";
 import { loadTenantContext } from "./context";
+import { formatSse } from "./events";
+import type { AgentEvent } from "./events";
 import type { AgentResult, RunContext } from "./types";
 
 // Edge runtime global. The runtime targets Deno (Supabase Edge Functions).
@@ -13,6 +15,15 @@ const CORS: Record<string, string> = {
   "access-control-allow-origin": "*",
   "access-control-allow-headers": "authorization, content-type",
   "access-control-allow-methods": "POST, OPTIONS",
+};
+
+const SSE_HEADERS: Record<string, string> = {
+  ...CORS,
+  "content-type": "text/event-stream; charset=utf-8",
+  "cache-control": "no-cache, no-transform",
+  connection: "keep-alive",
+  // Disable nginx-style proxy buffering so frames flush as they're enqueued.
+  "x-accel-buffering": "no",
 };
 
 export interface HandlerOptions {
@@ -54,9 +65,22 @@ async function devEnvLoadContext(
   };
 }
 
+function randomRunId(): string {
+  const g = globalThis as { crypto?: { randomUUID?: () => string } };
+  if (g.crypto?.randomUUID) return g.crypto.randomUUID();
+  // Fallback for environments without WebCrypto. Not security-sensitive — this
+  // is purely a correlation id surfaced to the client.
+  return `run_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
+}
+
 /**
  * Builds the agent HTTP handler. Drop this straight into a Supabase Edge
  * Function:  Deno.serve(createAgentHandler());
+ *
+ * SPRINT 3: the response is now `text/event-stream`. Each phase of the
+ * orchestrator emits a typed event from `./events` — plan, tool_start,
+ * tool_end, answer, critic, final, error. Consumers should use
+ * `createAgentClient` from `@blackrock/agent-core` to consume it.
  *
  * Context resolution order, per request:
  *   1. Caller-supplied `opts.loadTenantContext` (merged with `opts.registry`).
@@ -71,63 +95,112 @@ export function createAgentHandler(opts: HandlerOptions = {}) {
 
   return async (req: Request): Promise<Response> => {
     if (req.method === "OPTIONS") return new Response(null, { headers: CORS });
-    if (req.method !== "POST") return json({ error: "POST only" }, 405);
+    if (req.method !== "POST") return jsonResponse({ error: "POST only" }, 405);
 
+    // Validate the request body BEFORE opening the SSE stream so a malformed
+    // POST still gets a clean 400 instead of an event-stream that just errors.
+    let tenantId: string;
+    let message: string;
+    let model = "";
     try {
-      // Edge handler reads arbitrary JSON; cast is unavoidable at the boundary.
       const body: any = await req.json();
-      const tenantId = body?.tenantId;
-      const message = body?.message;
-      const model = body?.model ?? "";
+      tenantId = body?.tenantId;
+      message = body?.message;
+      model = body?.model ?? "";
       if (!tenantId || !message) {
-        return json({ error: "tenantId and message are required" }, 400);
-      }
-
-      let ctx: RunContext;
-      if (customLoad) {
-        const base = await customLoad(tenantId, model);
-        ctx = { ...base, registry };
-      } else if (Deno.env.get("AGENT_ENV") === "dev") {
-        const base = await devEnvLoadContext(tenantId, model);
-        ctx = { ...base, registry };
-      } else {
-        // Production: Vault-backed keys + per-tenant registry from ./context.
-        ctx = await loadTenantContext(tenantId, model);
-      }
-
-      const graph = await plan(ctx, message);
-      const results = await execute(ctx, graph);
-      let answer = await synthesize(ctx, message, results);
-      const verdict = await critique(ctx, message, answer, results);
-
-      if (!verdict.ok) {
-        // one corrective pass against the verifier's feedback
-        answer = await synthesize(
-          ctx,
-          `${message}\n\nVerifier feedback to address: ${verdict.notes}`,
-          results
+        return jsonResponse(
+          { error: "tenantId and message are required" },
+          400
         );
       }
-
-      const result: AgentResult = {
-        answer,
-        verified: verdict.ok,
-        criticNotes: verdict.notes,
-        taskGraph: graph,
-        results,
-      };
-      return json(result, 200);
-    } catch (e) {
-      // Log the full error server-side; return a generic message to the caller.
-      // Raw errors from loadTenantContext can include tenant ids, provider
-      // names, and Vault/RLS state — never leak that to an unauthenticated POST.
-      console.error("agent-handler error:", e);
-      return json({ error: "internal error" }, 500);
+    } catch {
+      return jsonResponse({ error: "invalid JSON body" }, 400);
     }
+
+    const runId = randomRunId();
+    const encoder = new TextEncoder();
+
+    const stream = new ReadableStream<Uint8Array>({
+      async start(controller) {
+        let closed = false;
+        const emit = (event: AgentEvent) => {
+          if (closed) return;
+          controller.enqueue(encoder.encode(formatSse(event)));
+        };
+
+        try {
+          emit({ type: "start", runId, tenantId });
+
+          // 1. Resolve tenant context.
+          let ctx: RunContext;
+          if (customLoad) {
+            const base = await customLoad(tenantId, model);
+            ctx = { ...base, registry };
+          } else if (Deno.env.get("AGENT_ENV") === "dev") {
+            const base = await devEnvLoadContext(tenantId, model);
+            ctx = { ...base, registry };
+          } else {
+            ctx = await loadTenantContext(tenantId, model);
+          }
+
+          // 2. Plan.
+          const graph = await plan(ctx, message);
+          emit({ type: "plan", graph });
+
+          // 3. Execute tools — executor emits tool_start / tool_end per task.
+          const results = await execute(ctx, graph, { onEvent: emit });
+
+          // 4. Synthesize a draft answer.
+          let answer = await synthesize(ctx, message, results);
+          emit({ type: "answer", text: answer });
+
+          // 5. Critic pass — optionally correct once against verifier feedback.
+          const verdict = await critique(ctx, message, answer, results);
+          emit({
+            type: "critic",
+            ok: verdict.ok,
+            notes: verdict.notes,
+          });
+
+          if (!verdict.ok) {
+            answer = await synthesize(
+              ctx,
+              `${message}\n\nVerifier feedback to address: ${verdict.notes}`,
+              results
+            );
+            emit({ type: "answer", text: answer });
+          }
+
+          const result: AgentResult = {
+            answer,
+            verified: verdict.ok,
+            criticNotes: verdict.notes,
+            taskGraph: graph,
+            results,
+          };
+          emit({ type: "final", result });
+        } catch (e) {
+          // Log the full error server-side; emit a sanitized message to the
+          // caller. Raw errors from loadTenantContext can include tenant ids,
+          // provider names, and Vault/RLS state — never leak that downstream.
+          console.error("agent-handler error:", e);
+          emit({ type: "error", message: "internal error" });
+        } finally {
+          closed = true;
+          controller.close();
+        }
+      },
+      cancel() {
+        // Client disconnected — nothing to clean up here yet; the orchestrator
+        // returns naturally because emit() short-circuits once `closed`.
+      },
+    });
+
+    return new Response(stream, { headers: SSE_HEADERS });
   };
 }
 
-function json(body: unknown, status: number): Response {
+function jsonResponse(body: unknown, status: number): Response {
   return new Response(JSON.stringify(body), {
     status,
     headers: { ...CORS, "content-type": "application/json" },
