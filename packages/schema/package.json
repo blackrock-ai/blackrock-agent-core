@@ -9,6 +9,7 @@
   },
   "dependencies": {
     "@blackrock/agent-runtime": "workspace:*",
+    "@blackrock/agent-tools": "workspace:*",
     "@supabase/supabase-js": "^2.45.0"
   },
   "devDependencies": {
