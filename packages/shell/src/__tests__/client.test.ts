@@ -43,6 +43,7 @@ const SAMPLE: AgentEvent[] = [
       verified: true,
       taskGraph: { tasks: [] },
       results: [],
+      usage: { tokensIn: 0, tokensOut: 0, cost: 0 },
     },
   },
 ];

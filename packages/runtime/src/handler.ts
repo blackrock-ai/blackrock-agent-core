@@ -147,19 +147,39 @@ export function createAgentHandler(opts: HandlerOptions = {}) {
             ctx = await loadTenantContext(tenantId, model);
           }
 
+          // Per-run token accumulator. Each LLM-touching phase returns its
+          // own usage which we sum here.
+          let tokensIn = 0;
+          let tokensOut = 0;
+          let cost = 0;
+          const addUsage = (u: {
+            tokensIn: number;
+            tokensOut: number;
+            cost: number;
+          }) => {
+            tokensIn += u.tokensIn;
+            tokensOut += u.tokensOut;
+            cost += u.cost;
+          };
+
           // 2. Plan.
-          const graph = await plan(ctx, message);
+          const planned = await plan(ctx, message);
+          addUsage(planned.usage);
+          const graph = planned.graph;
           emit({ type: "plan", graph });
 
           // 3. Execute tools — executor emits tool_start / tool_end per task.
           const results = await execute(ctx, graph, { onEvent: emit });
 
           // 4. Synthesize a draft answer.
-          let answer = await synthesize(ctx, message, results);
+          const drafted = await synthesize(ctx, message, results);
+          addUsage(drafted.usage);
+          let answer = drafted.text;
           emit({ type: "answer", text: answer });
 
           // 5. Critic pass — optionally correct once against verifier feedback.
           const verdict = await critique(ctx, message, answer, results);
+          addUsage(verdict.usage);
           emit({
             type: "critic",
             ok: verdict.ok,
@@ -167,11 +187,13 @@ export function createAgentHandler(opts: HandlerOptions = {}) {
           });
 
           if (!verdict.ok) {
-            answer = await synthesize(
+            const corrected = await synthesize(
               ctx,
               `${message}\n\nVerifier feedback to address: ${verdict.notes}`,
               results
             );
+            addUsage(corrected.usage);
+            answer = corrected.text;
             emit({ type: "answer", text: answer });
           }
 
@@ -181,6 +203,7 @@ export function createAgentHandler(opts: HandlerOptions = {}) {
             criticNotes: verdict.notes,
             taskGraph: graph,
             results,
+            usage: { tokensIn, tokensOut, cost },
           };
           emit({ type: "final", result });
         } catch (e) {

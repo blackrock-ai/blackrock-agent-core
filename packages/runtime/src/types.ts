@@ -33,10 +33,17 @@ export interface ToolResult {
   error?: string;
 }
 
+export interface TokenUsage {
+  tokensIn: number;
+  tokensOut: number;
+  cost: number;
+}
+
 export interface AgentResult {
   answer: string;
   verified: boolean;
   criticNotes?: string;
   taskGraph: TaskGraph;
   results: ToolResult[];
+  usage: TokenUsage;
 }

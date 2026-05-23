@@ -1,15 +1,20 @@
 import { callModel } from "./model";
-import type { RunContext, ToolResult } from "./types";
+import type { RunContext, TokenUsage, ToolResult } from "./types";
 
 const SYSTEM = `You are Agent Core's writer. Using only the tool evidence,
 answer the user clearly and concisely. Do not claim anything the evidence does
 not support. Write like a knowledgeable operator — never like a chatbot.`;
 
+export interface SynthesizeResult {
+  text: string;
+  usage: TokenUsage;
+}
+
 export async function synthesize(
   ctx: RunContext,
   message: string,
   results: ToolResult[]
-): Promise<string> {
+): Promise<SynthesizeResult> {
   const evidence = results
     .map(
       (r) =>
@@ -21,11 +26,19 @@ export async function synthesize(
     evidence || "(no tools were run)"
   }\n\nWrite the answer.`;
 
-  return callModel({
+  const call = await callModel({
     provider: ctx.modelProvider,
     apiKey: ctx.apiKey,
     model: ctx.model,
     system: SYSTEM,
     prompt,
   });
+  return {
+    text: call.text,
+    usage: {
+      tokensIn: call.tokensIn,
+      tokensOut: call.tokensOut,
+      cost: call.cost,
+    },
+  };
 }

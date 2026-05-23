@@ -42,6 +42,7 @@ const SAMPLE_EVENTS: AgentEvent[] = [
       verified: true,
       taskGraph: { tasks: [] },
       results: [],
+      usage: { tokensIn: 12, tokensOut: 34, cost: 0.0001 },
     },
   },
   { type: "error", message: "internal error" },
