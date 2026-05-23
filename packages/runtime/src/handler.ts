@@ -6,6 +6,12 @@ import { critique } from "./critic";
 import { loadTenantContext } from "./context";
 import { formatSse } from "./events";
 import type { AgentEvent } from "./events";
+import {
+  finalizeRun,
+  recordMessage,
+  recordRunStart,
+  recordToolResults,
+} from "./persistence";
 import type { AgentResult, RunContext } from "./types";
 
 // Edge runtime global. The runtime targets Deno (Supabase Edge Functions).
@@ -68,9 +74,15 @@ async function devEnvLoadContext(
 function randomRunId(): string {
   const g = globalThis as { crypto?: { randomUUID?: () => string } };
   if (g.crypto?.randomUUID) return g.crypto.randomUUID();
-  // Fallback for environments without WebCrypto. Not security-sensitive — this
-  // is purely a correlation id surfaced to the client.
-  return `run_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
+  // Fallback only — Deno, Bun, and modern Node ship randomUUID, so this
+  // path is theoretical. We still generate a v4-shaped UUID so the value
+  // is insertable into agent_runs.id (uuid column) without coercion.
+  const bytes = new Uint8Array(16);
+  (globalThis.crypto as Crypto).getRandomValues(bytes);
+  bytes[6] = (bytes[6]! & 0x0f) | 0x40;
+  bytes[8] = (bytes[8]! & 0x3f) | 0x80;
+  const hex = Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
 }
 
 /**
@@ -132,6 +144,14 @@ export function createAgentHandler(opts: HandlerOptions = {}) {
           controller.enqueue(encoder.encode(formatSse(event)));
         };
 
+        // Per-run state visible to both the try and the finally below.
+        let tokensIn = 0;
+        let tokensOut = 0;
+        let cost = 0;
+        let finalGraph: AgentResult["taskGraph"] | undefined;
+        let runStatus: "completed" | "failed" = "failed";
+        let runError: string | undefined;
+
         try {
           emit({ type: "start", runId, tenantId });
 
@@ -147,11 +167,18 @@ export function createAgentHandler(opts: HandlerOptions = {}) {
             ctx = await loadTenantContext(tenantId, model);
           }
 
-          // Per-run token accumulator. Each LLM-touching phase returns its
-          // own usage which we sum here.
-          let tokensIn = 0;
-          let tokensOut = 0;
-          let cost = 0;
+          // Persist the agent_runs row + the user message before any LLM
+          // call. Best-effort: a persistence failure is logged but does not
+          // abort the agent run.
+          await recordRunStart({
+            runId,
+            tenantId,
+            model: ctx.model,
+            modelProvider: ctx.modelProvider,
+            userMessage: message,
+          });
+
+          // Per-LLM-call token accumulator.
           const addUsage = (u: {
             tokensIn: number;
             tokensOut: number;
@@ -166,16 +193,30 @@ export function createAgentHandler(opts: HandlerOptions = {}) {
           const planned = await plan(ctx, message);
           addUsage(planned.usage);
           const graph = planned.graph;
+          finalGraph = graph;
           emit({ type: "plan", graph });
+          await recordMessage({
+            runId,
+            tenantId,
+            role: "assistant",
+            content: { kind: "plan", graph, usage: planned.usage },
+          });
 
           // 3. Execute tools — executor emits tool_start / tool_end per task.
           const results = await execute(ctx, graph, { onEvent: emit });
+          await recordToolResults(runId, tenantId, results);
 
           // 4. Synthesize a draft answer.
           const drafted = await synthesize(ctx, message, results);
           addUsage(drafted.usage);
           let answer = drafted.text;
           emit({ type: "answer", text: answer });
+          await recordMessage({
+            runId,
+            tenantId,
+            role: "assistant",
+            content: { kind: "draft_answer", text: answer, usage: drafted.usage },
+          });
 
           // 5. Critic pass — optionally correct once against verifier feedback.
           const verdict = await critique(ctx, message, answer, results);
@@ -184,6 +225,17 @@ export function createAgentHandler(opts: HandlerOptions = {}) {
             type: "critic",
             ok: verdict.ok,
             notes: verdict.notes,
+          });
+          await recordMessage({
+            runId,
+            tenantId,
+            role: "assistant",
+            content: {
+              kind: "critic",
+              ok: verdict.ok,
+              notes: verdict.notes,
+              usage: verdict.usage,
+            },
           });
 
           if (!verdict.ok) {
@@ -195,6 +247,16 @@ export function createAgentHandler(opts: HandlerOptions = {}) {
             addUsage(corrected.usage);
             answer = corrected.text;
             emit({ type: "answer", text: answer });
+            await recordMessage({
+              runId,
+              tenantId,
+              role: "assistant",
+              content: {
+                kind: "final_answer",
+                text: answer,
+                usage: corrected.usage,
+              },
+            });
           }
 
           const result: AgentResult = {
@@ -206,13 +268,27 @@ export function createAgentHandler(opts: HandlerOptions = {}) {
             usage: { tokensIn, tokensOut, cost },
           };
           emit({ type: "final", result });
+          runStatus = "completed";
         } catch (e) {
           // Log the full error server-side; emit a sanitized message to the
           // caller. Raw errors from loadTenantContext can include tenant ids,
           // provider names, and Vault/RLS state — never leak that downstream.
           console.error("agent-handler error:", e);
+          runStatus = "failed";
+          runError = e instanceof Error ? e.message : String(e);
           emit({ type: "error", message: "internal error" });
         } finally {
+          // Best-effort terminal update — fires even if the try threw before
+          // ctx was resolved, so the agent_runs row always lands in a
+          // terminal state instead of being stuck in 'running'.
+          await finalizeRun({
+            runId,
+            tenantId,
+            status: runStatus,
+            usage: { tokensIn, tokensOut, cost },
+            taskGraph: finalGraph,
+            error: runError,
+          });
           closed = true;
           controller.close();
         }

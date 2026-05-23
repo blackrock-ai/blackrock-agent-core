@@ -6,6 +6,7 @@ export { execute } from "./executor";
 export { synthesize } from "./synthesizer";
 export { critique } from "./critic";
 export { callModel } from "./model";
+export type { ModelCallResult } from "./model";
 export type {
   RunContext,
   Task,
@@ -13,7 +14,20 @@ export type {
   ToolResult,
   AgentResult,
   ModelProvider,
+  TokenUsage,
 } from "./types";
+export {
+  recordRunStart,
+  recordMessage,
+  recordToolResults,
+  finalizeRun,
+} from "./persistence";
+export type {
+  MessageRole,
+  RecordRunStartInput,
+  RecordMessageInput,
+  FinalizeRunInput,
+} from "./persistence";
 export { formatSse, parseSseFrame, parseSseChunk } from "./events";
 export type {
   AgentEvent,
