@@ -1,0 +1,2 @@
+[api]
+schemas = ["public", "storage"]

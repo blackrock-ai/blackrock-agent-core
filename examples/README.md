@@ -7,7 +7,7 @@ never in agent-core.
 The host app then renders:
 
 ```tsx
-import { Workspace } from "@blackrock/agent-core";
+import { Workspace } from "@blackrock-ai/agent-core";
 import { qepConfig } from "./agent.config";
 
 <Workspace

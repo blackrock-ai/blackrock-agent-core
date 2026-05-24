@@ -11,7 +11,7 @@ import {
   Database,
   Mail,
 } from "lucide-react";
-import type { TenantConfig } from "@blackrock/agent-core";
+import type { TenantConfig } from "@blackrock-ai/agent-core";
 
 export const qepConfig: TenantConfig = {
   id: "qep",

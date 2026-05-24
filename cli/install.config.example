@@ -1,0 +1,20 @@
+# Agent Core install configuration. Copy to cli/install.config and edit before running install.sh.
+# All paths absolute.
+
+# Target client repo (root of a git repo with supabase/ directory)
+TARGET_REPO=/path/to/blackrock-command-center
+
+# Tenant slug (e.g. "blackrock", "qep", "redex") — must be unique per Supabase project
+TENANT_SLUG=blackrock
+
+# Target Supabase project ref (the 20-char id, e.g. gsvhuzpysxaegoecwjmf)
+SUPABASE_PROJECT_REF=gsvhuzpysxaegoecwjmf
+
+# Target web app source directory (inside TARGET_REPO) where the shell will be mounted
+TARGET_WEB_DIR=src/app
+
+# Migration numbering style: "supabase_timestamp" (YYYYMMDDHHMMSS_) or "sequential" (NNNN_)
+MIGRATION_STYLE=supabase_timestamp
+
+# Optional: tenant display name (defaults to TENANT_SLUG titlecased)
+TENANT_DISPLAY_NAME="BlackRock AI"

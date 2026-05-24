@@ -4,3 +4,30 @@ dist/
 .DS_Store
 .env
 .env.local
+
+# Local agent/runtime state — never committed
+.omx/
+
+# Supabase CLI scratch
+supabase/.temp/
+
+# Per-run briefings & manifests handed in alongside the autoloop —
+# their canonical copies live in docs/architecture.md and the build
+# directive. Root-level copies are transient reference material only.
+agent-core-sprint5-briefing.md
+agent-core-master-manifest.md
+
+# Operator-local install configuration. cli/install.config.example
+# is the committed template; the actual cli/install.config holds
+# per-target values (paths, project refs) and stays local —
+# EXCEPT when used as the dry-run fixture (see comment at top of
+# that file).
+
+# Per-install manifest written by cli/install.sh into target's
+# .agent-core-install/. Inside the fixture, it's transient state.
+cli/.fixtures/fake-target-repo/.agent-core-install/
+
+# Fixture's inner .git is created on demand by the test setup; never
+# committed into the outer repo (git refuses nested embedded repos).
+# See cli/.fixtures/fake-target-repo/README.md for the setup command.
+cli/.fixtures/fake-target-repo/.git/
