@@ -35,6 +35,8 @@ const SAMPLE_EVENTS: AgentEvent[] = [
   },
   { type: "answer", text: "ok" },
   { type: "critic", ok: true, notes: "" },
+  { type: "rate_limited", retry_after_sec: 10, subject: "tenant:t_acme" },
+  { type: "quota_exceeded", limited_by: "runs", usage: 101, limit: 100 },
   {
     type: "final",
     result: {

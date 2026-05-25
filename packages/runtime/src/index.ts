@@ -29,6 +29,12 @@ export type {
   FinalizeRunInput,
 } from "./persistence";
 export { formatSse, parseSseFrame, parseSseChunk } from "./events";
+export { checkRateLimit } from "./rate-limiter";
+export type { RateLimitCheckResult, RateLimitContext } from "./rate-limiter";
+export { AuditBatch } from "./audit";
+export type { AuditEventInput, AuditSeverity } from "./audit";
+export { loadQuotaState } from "./quota";
+export type { QuotaState } from "./quota";
 export type {
   AgentEvent,
   AgentEventType,

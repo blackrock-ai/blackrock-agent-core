@@ -1,4 +1,5 @@
 import { ToolRegistry, builtins } from "@blackrock-ai/agent-tools";
+import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 import { plan } from "./planner";
 import { execute } from "./executor";
 import { synthesize } from "./synthesizer";
@@ -12,21 +13,18 @@ import {
   recordRunStart,
   recordToolResults,
 } from "./persistence";
-import type {
-  AgentResult,
-  RunContext,
-  TaskGraph,
-  ToolResult,
-  TokenUsage,
-} from "./types";
-import { authorizeRuntimeTenant } from "./auth";
+import type { AgentResult, RunContext, TaskGraph, ToolResult, TokenUsage } from "./types";
+import { authorizeRuntimeTenant, decodeJwtClaimsFromAuthHeader } from "./auth";
+import { checkRateLimit } from "./rate-limiter";
+import { AuditBatch } from "./audit";
+import { loadQuotaState } from "./quota";
+import { AGENT_CORE_SCHEMA } from "./constants";
 
-// Edge runtime global. The runtime targets Deno (Supabase Edge Functions).
 declare const Deno: { env: { get(name: string): string | undefined } };
 
 const CORS: Record<string, string> = {
   "access-control-allow-origin": "*",
-  "access-control-allow-headers": "authorization, content-type, x-agent-core-impersonate-tenant",
+  "access-control-allow-headers": "authorization, content-type, x-agent-core-impersonate-tenant, x-forwarded-for",
   "access-control-allow-methods": "POST, OPTIONS",
 };
 
@@ -43,15 +41,10 @@ const SSE_HEADERS: Record<string, string> = {
   "content-type": "text/event-stream; charset=utf-8",
   "cache-control": "no-cache, no-transform",
   connection: "keep-alive",
-  // Disable nginx-style proxy buffering so frames flush as they're enqueued.
   "x-accel-buffering": "no",
 };
 
 export interface HandlerOptions {
-  /**
-   * SPRINT 1: replace the default with a Supabase Vault-backed lookup that
-   * resolves per-tenant credentials from the `tenant_credentials` table.
-   */
   loadTenantContext?: (
     tenantId: string,
     model: string
@@ -80,19 +73,36 @@ function defaultRegistry(): ToolRegistry {
   return r;
 }
 
-// SPRINT 1 dev-only fallback. Gated behind AGENT_ENV=dev. Reads keys straight
-// from the Edge Function's env so the scaffold runs without a Vault round-trip.
-// Production takes the Vault path in `loadTenantContext` (see ./context.ts).
+function readEnv(name: string): string | undefined {
+  const g = globalThis as {
+    Deno?: { env: { get(n: string): string | undefined } };
+    process?: { env: Record<string, string | undefined> };
+  };
+  return g.Deno?.env.get(name) ?? g.process?.env?.[name];
+}
+
+// any: schema-parameterized SupabaseClient type from createClient is wider than
+// the imported default SupabaseClient alias in this file.
+let cachedSupabase: any = null;
+function getServiceSupabase(): SupabaseClient | null {
+  if (cachedSupabase) return cachedSupabase;
+  const url = readEnv("SUPABASE_URL");
+  const key = readEnv("SUPABASE_SERVICE_ROLE_KEY");
+  if (!url || !key) return null;
+  cachedSupabase = createClient(url, key, {
+    auth: { persistSession: false },
+    db: { schema: AGENT_CORE_SCHEMA },
+  });
+  return cachedSupabase;
+}
+
 async function devEnvLoadContext(
   tenantId: string,
   model: string
 ): Promise<Omit<RunContext, "registry">> {
   const provider =
-    (Deno.env.get("AGENT_MODEL_PROVIDER") as "anthropic" | "openai") ??
-    "anthropic";
-  const apiKey =
-    Deno.env.get(provider === "anthropic" ? "ANTHROPIC_KEY" : "OPENAI_KEY") ??
-    "";
+    (Deno.env.get("AGENT_MODEL_PROVIDER") as "anthropic" | "openai") ?? "anthropic";
+  const apiKey = Deno.env.get(provider === "anthropic" ? "ANTHROPIC_KEY" : "OPENAI_KEY") ?? "";
   return {
     tenantId,
     model: model || Deno.env.get("AGENT_MODEL") || "claude-sonnet-4-5",
@@ -104,9 +114,6 @@ async function devEnvLoadContext(
 function randomRunId(): string {
   const g = globalThis as { crypto?: { randomUUID?: () => string } };
   if (g.crypto?.randomUUID) return g.crypto.randomUUID();
-  // Fallback only — Deno, Bun, and modern Node ship randomUUID, so this
-  // path is theoretical. We still generate a v4-shaped UUID so the value
-  // is insertable into agent_runs.id (uuid column) without coercion.
   const bytes = new Uint8Array(16);
   (globalThis.crypto as Crypto).getRandomValues(bytes);
   bytes[6] = (bytes[6]! & 0x0f) | 0x40;
@@ -115,23 +122,12 @@ function randomRunId(): string {
   return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
 }
 
-/**
- * Builds the agent HTTP handler. Drop this straight into a Supabase Edge
- * Function:  Deno.serve(createAgentHandler());
- *
- * SPRINT 3: the response is now `text/event-stream`. Each phase of the
- * orchestrator emits a typed event from `./events` — plan, tool_start,
- * tool_end, answer, critic, final, error. Consumers should use
- * `createAgentClient` from `@blackrock-ai/agent-core` (the shell package) to
- * consume it.
- *
- * Context resolution order, per request:
- *   1. Caller-supplied `opts.loadTenantContext` (merged with `opts.registry`).
- *   2. AGENT_ENV=dev: env-var fallback (merged with `opts.registry`).
- *   3. Default (production): `loadTenantContext` from ./context — Vault-backed
- *      keys AND a per-tenant ToolRegistry. The default `opts.registry` is
- *      discarded in this path so tenants only see tools they've enabled.
- */
+function firstForwardedIp(req: Request): string {
+  const raw = req.headers.get("x-forwarded-for");
+  if (!raw) return "unknown";
+  return raw.split(",")[0]?.trim() || "unknown";
+}
+
 export function createAgentHandler(opts: HandlerOptions = {}) {
   const customLoad = opts.loadTenantContext;
   const registry = opts.registry ?? defaultRegistry();
@@ -148,8 +144,6 @@ export function createAgentHandler(opts: HandlerOptions = {}) {
     if (req.method === "OPTIONS") return new Response(null, { headers: CORS });
     if (req.method !== "POST") return jsonResponse({ error: "POST only" }, 405);
 
-    // Validate the request body BEFORE opening the SSE stream so a malformed
-    // POST still gets a clean 400 instead of an event-stream that just errors.
     let tenantId: string;
     let message: string;
     let model = "";
@@ -158,44 +152,91 @@ export function createAgentHandler(opts: HandlerOptions = {}) {
       if (rawBody.byteLength > 256 * 1024) {
         return jsonResponse({ error: "payload too large" }, 413);
       }
-
       const parsed = JSON.parse(new TextDecoder().decode(rawBody)) as Record<string, unknown>;
       const bodyTenantId = typeof parsed.tenantId === "string" ? parsed.tenantId : "";
-      if (!bodyTenantId) {
-        return jsonResponse({ error: "tenantId and message are required" }, 400);
-      }
-
-      if (typeof parsed.message !== "string") {
-        return jsonResponse({ error: "message must be a string" }, 400);
-      }
+      if (!bodyTenantId) return jsonResponse({ error: "tenantId and message are required" }, 400);
+      if (typeof parsed.message !== "string") return jsonResponse({ error: "message must be a string" }, 400);
       message = parsed.message;
-
-      if (parsed.model !== undefined && typeof parsed.model !== "string") {
-        return jsonResponse({ error: "model must be a string" }, 400);
-      }
+      if (parsed.model !== undefined && typeof parsed.model !== "string") return jsonResponse({ error: "model must be a string" }, 400);
       model = typeof parsed.model === "string" ? parsed.model : "";
-
       const tenantAuth = authorizeRuntimeTenant(bodyTenantId, req.headers);
-      if (!tenantAuth.ok) {
-        return jsonResponse({ error: tenantAuth.error }, tenantAuth.status);
-      }
+      if (!tenantAuth.ok) return jsonResponse({ error: tenantAuth.error }, tenantAuth.status);
       tenantId = tenantAuth.tenantId;
-
-      if (message.length > 100_000) {
-        return jsonResponse({ error: "message too long" }, 400);
-      }
-      if (model.length > 64) {
-        return jsonResponse({ error: "model too long" }, 400);
-      }
+      if (message.length > 100_000) return jsonResponse({ error: "message too long" }, 400);
+      if (model.length > 64) return jsonResponse({ error: "model too long" }, 400);
     } catch {
       return jsonResponse({ error: "invalid JSON body" }, 400);
     }
 
+    const supabase = getServiceSupabase();
+
+    const claims = decodeJwtClaimsFromAuthHeader(req.headers.get("authorization"));
+    const subjectTenant = `tenant:${tenantId}`;
+    const subjectUser = `user:${claims?.sub ?? "unknown"}`;
+    const subjectIp = `ip:${firstForwardedIp(req)}`;
+    if (supabase) {
+      const rateChecks = await Promise.allSettled([
+        checkRateLimit({ supabase, tenantId, subject: subjectTenant, windowSecs: 60, limit: 60 }),
+        checkRateLimit({ supabase, tenantId, subject: subjectUser, windowSecs: 60, limit: 30 }),
+        checkRateLimit({ supabase, tenantId, subject: subjectIp, windowSecs: 60, limit: 100 }),
+      ]);
+
+      const denied = rateChecks
+        .map((r, idx) => ({ r, subject: [subjectTenant, subjectUser, subjectIp][idx]! }))
+        .find((entry) => entry.r.status === "fulfilled" && entry.r.value.ok === false);
+
+      if (denied && denied.r.status === "fulfilled") {
+        await supabase.rpc("record_audit_event", {
+          p_tenant: tenantId,
+          p_event: "rate_limit_triggered",
+          p_severity: "warn",
+          p_subject: denied.subject,
+          p_meta: { retry_after_sec: denied.r.value.retryAfterSec ?? 1 },
+        });
+        return new Response(JSON.stringify({ error: "rate_limited" }), {
+          status: 429,
+          headers: {
+            ...CORS,
+            "content-type": "application/json",
+            "Retry-After": String(denied.r.value.retryAfterSec ?? 1),
+          },
+        });
+      }
+    }
+
+    const ctxBasePre = await (customLoad
+      ? customLoad(tenantId, model)
+      : Deno.env.get("AGENT_ENV") === "dev"
+        ? devEnvLoadContext(tenantId, model)
+        : loadTenantContext(tenantId, model));
+
+    if (supabase) {
+      const quotaStatePre = await loadQuotaState(supabase, tenantId);
+      if (quotaStatePre.paused) {
+        await supabase.rpc("record_audit_event", {
+          p_tenant: tenantId,
+          p_event: "tenant_paused_request_denied",
+          p_severity: "warn",
+          p_subject: subjectTenant,
+          p_meta: {},
+        });
+        return jsonResponse({ error: "tenant paused" }, 503);
+      }
+
+      if (!quotaStatePre.ok) {
+        await supabase.rpc("record_audit_event", {
+          p_tenant: tenantId,
+          p_event: "quota_exceeded",
+          p_severity: "warn",
+          p_subject: subjectTenant,
+          p_meta: { limited_by: quotaStatePre.limitedBy },
+        });
+        return jsonResponse({ error: `quota: ${quotaStatePre.limitedBy ?? "unknown"}` }, 429);
+      }
+    }
+
     const runId = randomRunId();
     const encoder = new TextEncoder();
-    // Hoisted so the `cancel` callback can flip it on client disconnect —
-    // otherwise pending emit() calls would try to enqueue into a cancelled
-    // controller until the orchestrator returns naturally.
     let closed = false;
 
     const stream = new ReadableStream<Uint8Array>({
@@ -205,7 +246,6 @@ export function createAgentHandler(opts: HandlerOptions = {}) {
           controller.enqueue(encoder.encode(formatSse(event)));
         };
 
-        // Per-run state visible to both the try and the finally below.
         let tokensIn = 0;
         let tokensOut = 0;
         let cost = 0;
@@ -214,25 +254,13 @@ export function createAgentHandler(opts: HandlerOptions = {}) {
         let finalGraph: AgentResult["taskGraph"] | undefined;
         let runStatus: "completed" | "failed" = "failed";
         let runError: string | undefined;
+        const auditBatch = supabase ? new AuditBatch(supabase) : null;
 
         try {
           emit({ type: "start", runId, tenantId });
 
-          // 1. Resolve tenant context.
-          let ctx: RunContext;
-          if (customLoad) {
-            const base = await customLoad(tenantId, model);
-            ctx = { ...base, registry };
-          } else if (Deno.env.get("AGENT_ENV") === "dev") {
-            const base = await devEnvLoadContext(tenantId, model);
-            ctx = { ...base, registry };
-          } else {
-            ctx = await loadTenantContext(tenantId, model);
-          }
+          const ctx: RunContext = { ...ctxBasePre, registry };
 
-          // Persist the agent_runs row + the user message before any LLM
-          // call. Best-effort: a persistence failure is logged but does not
-          // abort the agent run.
           await persistRunStart({
             runId,
             tenantId,
@@ -241,62 +269,40 @@ export function createAgentHandler(opts: HandlerOptions = {}) {
             userMessage: message,
           });
 
-          // Per-LLM-call token accumulator.
-          const failBudget = (message: string): false => {
+          const failBudget = (reason: string): false => {
             runStatus = "failed";
-            runError = message;
-            emit({ type: "error", message });
+            runError = reason;
+            emit({ type: "error", message: reason });
             return false;
           };
 
-          const checkBudget = (_reason: string): boolean => {
-            if (Date.now() - runStartedAt > RUN_BUDGET.MAX_RUN_WALL_TIME_MS) {
-              return failBudget("run budget: wall time exceeded");
-            }
-            if (toolCallCount > RUN_BUDGET.MAX_TOOL_CALLS_PER_RUN) {
-              return failBudget("run budget: too many tool calls");
-            }
-            if (tokensIn + tokensOut > RUN_BUDGET.MAX_TOKENS_PER_RUN) {
-              return failBudget("run budget: token cap exceeded");
-            }
-            if (cost > RUN_BUDGET.MAX_COST_PER_RUN_USD) {
-              return failBudget("run budget: cost cap exceeded");
-            }
+          const checkBudget = (): boolean => {
+            if (Date.now() - runStartedAt > RUN_BUDGET.MAX_RUN_WALL_TIME_MS) return failBudget("run budget: wall time exceeded");
+            if (toolCallCount > RUN_BUDGET.MAX_TOOL_CALLS_PER_RUN) return failBudget("run budget: too many tool calls");
+            if (tokensIn + tokensOut > RUN_BUDGET.MAX_TOKENS_PER_RUN) return failBudget("run budget: token cap exceeded");
+            if (cost > RUN_BUDGET.MAX_COST_PER_RUN_USD) return failBudget("run budget: cost cap exceeded");
             return true;
           };
 
-          // Per-LLM-call token accumulator.
-          const addUsage = (u: {
-            tokensIn: number;
-            tokensOut: number;
-            cost: number;
-          }): boolean => {
+          const addUsage = (u: { tokensIn: number; tokensOut: number; cost: number }): boolean => {
             tokensIn += u.tokensIn;
             tokensOut += u.tokensOut;
             cost += u.cost;
-            return checkBudget("add_usage");
+            return checkBudget();
           };
 
-          // 2. Plan.
-          if (!checkBudget("before_planner")) return;
+          if (!checkBudget()) return;
           const planned = await planner(ctx, message);
           if (!addUsage(planned.usage)) return;
 
           let graph: TaskGraph = planned.graph;
-          const plannedTaskCount = planned.graph.tasks.length;
-          if (plannedTaskCount > RUN_BUDGET.MAX_TASKS_PER_GRAPH) {
-            graph = {
-              ...planned.graph,
-              tasks: planned.graph.tasks.slice(0, RUN_BUDGET.MAX_TASKS_PER_GRAPH),
-            };
-            emit({
-              type: "plan_truncated",
-              original: plannedTaskCount,
-              kept: RUN_BUDGET.MAX_TASKS_PER_GRAPH,
-            });
+          if (graph.tasks.length > RUN_BUDGET.MAX_TASKS_PER_GRAPH) {
+            graph = { ...graph, tasks: graph.tasks.slice(0, RUN_BUDGET.MAX_TASKS_PER_GRAPH) };
+            emit({ type: "plan_truncated", original: planned.graph.tasks.length, kept: RUN_BUDGET.MAX_TASKS_PER_GRAPH });
           }
           finalGraph = graph;
           emit({ type: "plan", graph });
+
           await persistMessage({
             runId,
             tenantId,
@@ -304,73 +310,31 @@ export function createAgentHandler(opts: HandlerOptions = {}) {
             content: { kind: "plan", graph, usage: planned.usage },
           });
 
-          // 3. Execute tools — executor emits tool_start / tool_end per task.
-          if (!checkBudget("before_execute")) return;
           const results = await executor(ctx, graph, {
             onEvent: emit,
             onWaveComplete: (completedCount) => {
               toolCallCount = completedCount;
-              return checkBudget("tool_wave");
+              return checkBudget();
             },
           });
           if (runStatus === "failed") return;
-          if (!checkBudget("after_execute")) return;
+
           await persistToolResults(runId, tenantId, results);
 
-          // 4. Synthesize a draft answer.
-          if (!checkBudget("before_synthesize")) return;
           const drafted = await synthesizer(ctx, message, results);
           if (!addUsage(drafted.usage)) return;
           let answer = drafted.text;
           emit({ type: "answer", text: answer });
-          await persistMessage({
-            runId,
-            tenantId,
-            role: "assistant",
-            content: { kind: "draft_answer", text: answer, usage: drafted.usage },
-          });
 
-          // 5. Critic pass — optionally correct once against verifier feedback.
-          if (!checkBudget("before_critic")) return;
           const verdict = await critic(ctx, message, answer, results);
           if (!addUsage(verdict.usage)) return;
-          emit({
-            type: "critic",
-            ok: verdict.ok,
-            notes: verdict.notes,
-          });
-          await persistMessage({
-            runId,
-            tenantId,
-            role: "assistant",
-            content: {
-              kind: "critic",
-              ok: verdict.ok,
-              notes: verdict.notes,
-              usage: verdict.usage,
-            },
-          });
+          emit({ type: "critic", ok: verdict.ok, notes: verdict.notes });
 
           if (!verdict.ok) {
-            if (!checkBudget("before_corrective_synthesize")) return;
-            const corrected = await synthesizer(
-              ctx,
-              `${message}\n\nVerifier feedback to address: ${verdict.notes}`,
-              results
-            );
+            const corrected = await synthesizer(ctx, `${message}\n\nVerifier feedback to address: ${verdict.notes}`, results);
             if (!addUsage(corrected.usage)) return;
             answer = corrected.text;
             emit({ type: "answer", text: answer });
-            await persistMessage({
-              runId,
-              tenantId,
-              role: "assistant",
-              content: {
-                kind: "final_answer",
-                text: answer,
-                usage: corrected.usage,
-              },
-            });
           }
 
           const result: AgentResult = {
@@ -381,6 +345,7 @@ export function createAgentHandler(opts: HandlerOptions = {}) {
             results,
             usage: { tokensIn, tokensOut, cost },
           };
+
           emit({
             type: "final",
             result,
@@ -391,19 +356,14 @@ export function createAgentHandler(opts: HandlerOptions = {}) {
               duration_ms: Date.now() - runStartedAt,
             },
           });
+
           runStatus = "completed";
         } catch (e) {
-          // Log the full error server-side; emit a sanitized message to the
-          // caller. Raw errors from loadTenantContext can include tenant ids,
-          // provider names, and Vault/RLS state — never leak that downstream.
           console.error("agent-handler error:", e);
           runStatus = "failed";
           runError = redactSecrets(e instanceof Error ? e.message : String(e));
           emit({ type: "error", message: "internal error" });
         } finally {
-          // Best-effort terminal update — fires even if the try threw before
-          // ctx was resolved, so the agent_runs row always lands in a
-          // terminal state instead of being stuck in 'running'.
           await persistFinalizeRun({
             runId,
             tenantId,
@@ -412,14 +372,12 @@ export function createAgentHandler(opts: HandlerOptions = {}) {
             taskGraph: finalGraph,
             error: runError,
           });
+          await auditBatch?.flush();
           closed = true;
           controller.close();
         }
       },
       cancel() {
-        // Client disconnected. Flip `closed` so the orchestrator's pending
-        // emit() calls become no-ops until the pipeline returns naturally —
-        // we can't synchronously abort the in-flight LLM/tool calls from here.
         closed = true;
       },
     });

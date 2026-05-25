@@ -23,9 +23,22 @@ export type AgentEvent =
       ok: boolean;
       output: unknown;
       error?: string;
+      durationMs?: number;
+      costEstimate?: number;
     }
   | { type: "answer"; text: string }
   | { type: "critic"; ok: boolean; notes: string }
+  | {
+      type: "rate_limited";
+      retry_after_sec: number;
+      subject: string;
+    }
+  | {
+      type: "quota_exceeded";
+      limited_by: "runs" | "tokens" | "cost" | "paused";
+      usage: number;
+      limit: number;
+    }
   | {
       type: "final";
       result: AgentResult;
