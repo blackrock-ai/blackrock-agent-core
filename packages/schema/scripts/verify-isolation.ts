@@ -1,6 +1,6 @@
 // End-to-end tenant isolation verification for the credential / tool stack.
 //
-// Runs four invariants against a live Supabase project (local or remote) to
+// Runs five invariants against a live Supabase project (local or remote) to
 // prove that the migration 0002 credential-resolution path is correctly scoped
 // per-tenant and inaccessible to the anon role:
 //
@@ -12,6 +12,7 @@
 //      the builtins enabled in tenant_tools — tenant A sees http_request,
 //      tenant B (enabled=false) sees nothing.
 //   4. The anon role cannot call resolve_tenant_secret successfully.
+//   5. Non-service roles cannot execute the SECURITY DEFINER RPC set.
 //
 // Usage:
 //   bun packages/schema/scripts/verify-isolation.ts
@@ -23,7 +24,7 @@
 //
 // If any of those are missing OR Supabase is unreachable, the script writes a
 // single PARKED line to stdout and exits 0 — it never asks for a stack it
-// cannot drive. On full pass it prints `[isolation verified] all 4 invariants
+// cannot drive. On full pass it prints `[isolation verified] all 5 invariants
 // passed` and exits 0. On any assertion failure it prints `[fail] invariant N
 // — …` and exits 1.
 //
@@ -73,6 +74,17 @@ async function isReachable(
     return { ok: false, reason: err instanceof Error ? err.message : String(err) };
   }
 }
+
+const SECURITY_DEFINER_RPC_NAMES = [
+  'store_tenant_credential',
+  'resolve_tenant_secret',
+  'store_artifact',
+  'list_artifacts',
+  'read_tenant_table',
+  'store_tenant_connection',
+  'resolve_tenant_connection',
+  'update_tenant_connection_tokens',
+] as const;
 
 interface TenantRow {
   id: string;
@@ -323,7 +335,32 @@ async function main(): Promise<void> {
       );
     }
 
-    process.stdout.write('[isolation verified] all 4 invariants passed\n');
+    // ---------------------------------------------------------------------
+    // Invariant 5 — authenticated/anon surface cannot execute definer RPCs.
+    //
+    // We use the anon key as a non-service role probe. Every call must fail
+    // with permission-denied semantics (SQLSTATE 42501 or equivalent message).
+    // ---------------------------------------------------------------------
+    const anonForDefiner = createClient(supabaseUrl, anonKey, {
+      auth: { persistSession: false },
+      db: { schema: AGENT_CORE_SCHEMA },
+    });
+
+    for (const rpcName of SECURITY_DEFINER_RPC_NAMES) {
+      const { data, error } = await anonForDefiner.rpc(rpcName, {});
+      const code = (error as { code?: string } | null)?.code;
+      const msg = error?.message ?? '';
+      const denied = code === '42501' || /permission denied/i.test(msg);
+      if (!denied || data !== null) {
+        failAndExit(
+          5,
+          `${rpcName} unexpectedly callable by non-service role (code=${code ?? 'none'}, message=${msg || 'none'})`,
+        );
+      }
+    }
+    ok(5, `non-service role denied on ${SECURITY_DEFINER_RPC_NAMES.length} definer RPCs`);
+
+    process.stdout.write('[isolation verified] all 5 invariants passed\n');
   } finally {
     for (const id of tenantIds) {
       try {

@@ -30,6 +30,44 @@ import {
 
 declare const Deno: { env: { get(name: string): string | undefined } };
 
+interface JwtClaims {
+  tenant_id?: string;
+  role?: string;
+  sub?: string;
+  admin_role?: string;
+}
+
+/**
+ * Supabase Edge verifies JWT signatures before invocation; we decode payload
+ * claims only for tenant/role authorization checks.
+ */
+function decodeJwtClaimsFromAuthHeader(authHeader: string | null): JwtClaims | null {
+  if (!authHeader) return null;
+  const match = authHeader.match(/^Bearer\s+(.+)$/i);
+  if (!match) return null;
+  const token = match[1]?.trim();
+  if (!token) return null;
+  const parts = token.split(".");
+  if (parts.length < 2) return null;
+  const payload = parts[1];
+  if (!payload) return null;
+
+  try {
+    const normalized = payload.replace(/-/g, "+").replace(/_/g, "/");
+    const padded = normalized.padEnd(normalized.length + ((4 - (normalized.length % 4)) % 4), "=");
+    const decoded = atob(padded);
+    const parsed = JSON.parse(decoded) as Record<string, unknown>;
+    return {
+      tenant_id: typeof parsed.tenant_id === "string" ? parsed.tenant_id : undefined,
+      role: typeof parsed.role === "string" ? parsed.role : undefined,
+      sub: typeof parsed.sub === "string" ? parsed.sub : undefined,
+      admin_role: typeof parsed.admin_role === "string" ? parsed.admin_role : undefined,
+    };
+  } catch {
+    return null;
+  }
+}
+
 // mirrors packages/runtime/src/constants.ts
 const AGENT_CORE_SCHEMA = "agent_core";
 
@@ -91,12 +129,29 @@ function jsonResponse(body: unknown, status: number): Response {
 }
 
 async function handleStart(req: Request): Promise<Response> {
+  const claims = decodeJwtClaimsFromAuthHeader(req.headers.get("authorization"));
+  if (!claims) return jsonResponse({ error: "missing authorization token" }, 401);
+
   const url = new URL(req.url);
   const tenantId = url.searchParams.get("tenant_id") ?? "";
   const providerRaw = url.searchParams.get("provider") ?? "";
   const accountLabel = url.searchParams.get("account_label") ?? "default";
 
   if (!tenantId) return jsonResponse({ error: "tenant_id required" }, 400);
+
+  if (claims.role !== "service_role") {
+    if (!claims.tenant_id) {
+      return jsonResponse({ error: "missing tenant_id claim" }, 401);
+    }
+    if (claims.tenant_id !== tenantId) {
+      return jsonResponse({ error: "forbidden: tenant mismatch" }, 403);
+    }
+  }
+
+  const requireAdmin = Deno.env.get("OAUTH_REQUIRE_ADMIN") === "1";
+  if (requireAdmin && claims.role !== "service_role" && !claims.admin_role) {
+    return jsonResponse({ error: "forbidden: admin_role required" }, 403);
+  }
   if (!SUPPORTED.has(providerRaw as OauthProviderId)) {
     return jsonResponse({ error: "unsupported provider" }, 400);
   }

@@ -52,3 +52,5 @@ export type {
 } from "./oauth";
 
 export { AGENT_CORE_SCHEMA } from "./constants";
+export { decodeJwtClaimsFromAuthHeader, authorizeRuntimeTenant } from "./auth";
+export type { JwtClaims } from "./auth";

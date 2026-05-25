@@ -13,13 +13,14 @@ import {
   recordToolResults,
 } from "./persistence";
 import type { AgentResult, RunContext } from "./types";
+import { authorizeRuntimeTenant } from "./auth";
 
 // Edge runtime global. The runtime targets Deno (Supabase Edge Functions).
 declare const Deno: { env: { get(name: string): string | undefined } };
 
 const CORS: Record<string, string> = {
   "access-control-allow-origin": "*",
-  "access-control-allow-headers": "authorization, content-type",
+  "access-control-allow-headers": "authorization, content-type, x-agent-core-impersonate-tenant",
   "access-control-allow-methods": "POST, OPTIONS",
 };
 
@@ -116,15 +117,38 @@ export function createAgentHandler(opts: HandlerOptions = {}) {
     let message: string;
     let model = "";
     try {
-      const body: any = await req.json();
-      tenantId = body?.tenantId;
-      message = body?.message;
-      model = body?.model ?? "";
-      if (!tenantId || !message) {
-        return jsonResponse(
-          { error: "tenantId and message are required" },
-          400
-        );
+      const rawBody = await req.arrayBuffer();
+      if (rawBody.byteLength > 256 * 1024) {
+        return jsonResponse({ error: "payload too large" }, 413);
+      }
+
+      const parsed = JSON.parse(new TextDecoder().decode(rawBody)) as Record<string, unknown>;
+      const bodyTenantId = typeof parsed.tenantId === "string" ? parsed.tenantId : "";
+      if (!bodyTenantId) {
+        return jsonResponse({ error: "tenantId and message are required" }, 400);
+      }
+
+      if (typeof parsed.message !== "string") {
+        return jsonResponse({ error: "message must be a string" }, 400);
+      }
+      message = parsed.message;
+
+      if (parsed.model !== undefined && typeof parsed.model !== "string") {
+        return jsonResponse({ error: "model must be a string" }, 400);
+      }
+      model = typeof parsed.model === "string" ? parsed.model : "";
+
+      const tenantAuth = authorizeRuntimeTenant(bodyTenantId, req.headers);
+      if (!tenantAuth.ok) {
+        return jsonResponse({ error: tenantAuth.error }, tenantAuth.status);
+      }
+      tenantId = tenantAuth.tenantId;
+
+      if (message.length > 100_000) {
+        return jsonResponse({ error: "message too long" }, 400);
+      }
+      if (model.length > 64) {
+        return jsonResponse({ error: "model too long" }, 400);
       }
     } catch {
       return jsonResponse({ error: "invalid JSON body" }, 400);
@@ -275,7 +299,7 @@ export function createAgentHandler(opts: HandlerOptions = {}) {
           // provider names, and Vault/RLS state — never leak that downstream.
           console.error("agent-handler error:", e);
           runStatus = "failed";
-          runError = e instanceof Error ? e.message : String(e);
+          runError = redactSecrets(e instanceof Error ? e.message : String(e));
           emit({ type: "error", message: "internal error" });
         } finally {
           // Best-effort terminal update — fires even if the try threw before
@@ -303,6 +327,15 @@ export function createAgentHandler(opts: HandlerOptions = {}) {
 
     return new Response(stream, { headers: SSE_HEADERS });
   };
+}
+
+function redactSecrets(s: string): string {
+  return s
+    .replace(/sk-[A-Za-z0-9_-]+/g, "[REDACTED_API_KEY]")
+    .replace(/Bearer\s+[A-Za-z0-9._-]+/gi, "Bearer [REDACTED]")
+    .replace(/access_token/gi, "[REDACTED_TOKEN]")
+    .replace(/refresh_token/gi, "[REDACTED_TOKEN]")
+    .slice(0, 500);
 }
 
 function jsonResponse(body: unknown, status: number): Response {

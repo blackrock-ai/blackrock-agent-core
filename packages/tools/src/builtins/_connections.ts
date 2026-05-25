@@ -107,10 +107,7 @@ async function refreshTokens(
     signal: AbortSignal.timeout(30_000),
   });
   if (!res.ok) {
-    const text = await res.text().catch(() => "");
-    throw new Error(
-      `${provider}: refresh failed ${res.status}: ${text.slice(0, 400)}`
-    );
+    throw new Error(`${provider}: refresh failed (status ${res.status})`);
   }
   const payload = (await res.json()) as Record<string, unknown>;
   const newAccess =
@@ -139,7 +136,7 @@ async function refreshTokens(
   });
   if (error) {
     throw new Error(
-      `${provider}: failed to persist refreshed tokens: ${error.message}`
+      `${provider}: failed to persist refreshed tokens (status ${error.code ?? "unknown"})`
     );
   }
   return newAccess;
