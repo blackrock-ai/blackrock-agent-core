@@ -1,6 +1,7 @@
 /** Passed to every tool at run time. Host may attach a DB client, etc. */
 export interface ToolContext {
   tenantId: string;
+  meter?: (input: { units?: number; costUsd?: number }) => void;
   [key: string]: unknown;
 }
 

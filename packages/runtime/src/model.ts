@@ -1,57 +1,17 @@
 import type { ModelProvider } from "./types";
 
 /**
- * What `callModel` returns. Beyond the text response, we surface the token
- * counts reported by the IdP so the orchestrator can accumulate per-run
- * usage and write it into agent_runs.
- *
- * `cost` is a rough per-call estimate in USD using a fixed price table —
- * good enough for back-of-envelope dashboards, not authoritative. Callers
- * that need precise billing should source costs from the IdP invoice.
+ * What `callModel` returns. Beyond text, we return raw usage and provider
+ * metadata; metering persistence + billing logic is handled upstream.
  */
 export interface ModelCallResult {
   text: string;
   tokensIn: number;
   tokensOut: number;
-  cost: number;
-}
-
-interface ModelPriceRow {
-  input: number;
-  output: number;
-}
-
-// Rough USD-per-token pricing. Tighten as needed; ANY model not in the table
-// gets a default of zero so we never invent dollar figures.
-const PRICE_PER_TOKEN: Record<string, ModelPriceRow> = {
-  // Anthropic — Claude 4.x families.
-  "claude-opus-4-7": { input: 15 / 1_000_000, output: 75 / 1_000_000 },
-  "claude-opus-4-6": { input: 15 / 1_000_000, output: 75 / 1_000_000 },
-  "claude-sonnet-4-6": { input: 3 / 1_000_000, output: 15 / 1_000_000 },
-  "claude-sonnet-4-5": { input: 3 / 1_000_000, output: 15 / 1_000_000 },
-  "claude-haiku-4-5": { input: 0.8 / 1_000_000, output: 4 / 1_000_000 },
-  // OpenAI — common families.
-  "gpt-4o": { input: 5 / 1_000_000, output: 15 / 1_000_000 },
-  "gpt-4o-mini": { input: 0.15 / 1_000_000, output: 0.6 / 1_000_000 },
-  "o1": { input: 15 / 1_000_000, output: 60 / 1_000_000 },
-  "o1-mini": { input: 3 / 1_000_000, output: 12 / 1_000_000 },
-  "o3": { input: 60 / 1_000_000, output: 240 / 1_000_000 },
-};
-
-function estimateCost(
-  model: string,
-  tokensIn: number,
-  tokensOut: number
-): number {
-  // Walk the price table picking the LONGEST prefix that matches — so
-  // "claude-sonnet-4-5-20251022" still resolves to "claude-sonnet-4-5".
-  let bestKey = "";
-  for (const key of Object.keys(PRICE_PER_TOKEN)) {
-    if (model.startsWith(key) && key.length > bestKey.length) bestKey = key;
-  }
-  const row = bestKey ? PRICE_PER_TOKEN[bestKey] : undefined;
-  if (!row) return 0;
-  return tokensIn * row.input + tokensOut * row.output;
+  tokensCachedRead?: number;
+  tokensCachedWrite?: number;
+  finishReason?: string;
+  providerMetadata?: Record<string, unknown>;
 }
 
 /**
@@ -88,11 +48,16 @@ export async function callModel(opts: {
       .join("\n");
     const tokensIn = numberOr(data?.usage?.input_tokens, 0);
     const tokensOut = numberOr(data?.usage?.output_tokens, 0);
+    const tokensCachedRead = numberOr(data?.usage?.cache_read_input_tokens, 0);
+    const tokensCachedWrite = numberOr(data?.usage?.cache_creation_input_tokens, 0);
     return {
       text,
       tokensIn,
       tokensOut,
-      cost: estimateCost(opts.model, tokensIn, tokensOut),
+      tokensCachedRead,
+      tokensCachedWrite,
+      finishReason: typeof data?.stop_reason === "string" ? data.stop_reason : undefined,
+      providerMetadata: { usage: data?.usage ?? null, id: data?.id ?? null },
     };
   }
 
@@ -119,7 +84,10 @@ export async function callModel(opts: {
     text,
     tokensIn,
     tokensOut,
-    cost: estimateCost(opts.model, tokensIn, tokensOut),
+    tokensCachedRead: 0,
+    tokensCachedWrite: 0,
+    finishReason: typeof data?.choices?.[0]?.finish_reason === "string" ? data.choices[0].finish_reason : undefined,
+    providerMetadata: { usage: data?.usage ?? null, id: data?.id ?? null },
   };
 }
 

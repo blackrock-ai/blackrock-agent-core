@@ -47,6 +47,7 @@ export interface RecordRunStartInput {
   tenantId: string;
   model: string;
   modelProvider: string;
+  userId?: string | null;
   userMessage: string;
 }
 
@@ -65,6 +66,7 @@ export async function recordRunStart(input: RecordRunStartInput): Promise<boolea
       model: input.model,
       model_provider: input.modelProvider,
       status: "running",
+      user_id: input.userId ?? null,
     });
     if (runErr) {
       console.error("persistence: recordRunStart agent_runs insert failed:", runErr);

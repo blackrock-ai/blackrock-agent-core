@@ -36,7 +36,9 @@ export async function plan(ctx: RunContext, message: string): Promise<PlanResult
       usage: {
         tokensIn: call.tokensIn,
         tokensOut: call.tokensOut,
-        cost: call.cost,
+        tokensCachedRead: call.tokensCachedRead ?? 0,
+        tokensCachedWrite: call.tokensCachedWrite ?? 0,
+        cost: 0,
       },
     };
   } catch {

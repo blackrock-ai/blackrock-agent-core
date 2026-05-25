@@ -7,6 +7,8 @@ export { synthesize } from "./synthesizer";
 export { critique } from "./critic";
 export { callModel } from "./model";
 export type { ModelCallResult } from "./model";
+export { computeCost, recordLlmCall, recordToolInvocation } from "./metering";
+export type { CostCalcInput, CostCalcResult } from "./metering";
 export type {
   RunContext,
   Task,

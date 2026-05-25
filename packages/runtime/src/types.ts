@@ -31,11 +31,17 @@ export interface ToolResult {
   ok: boolean;
   output: unknown;
   error?: string;
+  startedAt?: Date;
+  finishedAt?: Date;
+  externalUnits?: number;
+  externalCostUsd?: number;
 }
 
 export interface TokenUsage {
   tokensIn: number;
   tokensOut: number;
+  tokensCachedRead?: number;
+  tokensCachedWrite?: number;
   cost: number;
 }
 

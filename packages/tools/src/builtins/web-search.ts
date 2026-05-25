@@ -46,7 +46,7 @@ export const webSearch: Tool = {
   key: "web_search",
   description:
     "Search the public web. Input: { query: string, count?: number }. Returns up to `count` results with { title, url, snippet }.",
-  async run(rawInput) {
+  async run(rawInput, ctx) {
     const input = rawInput as unknown as WebSearchInput;
     const query = String(input?.query ?? "").trim();
     if (!query) throw new Error("web_search requires a non-empty query");
@@ -106,6 +106,7 @@ export const webSearch: Tool = {
       : [];
 
     const output: WebSearchOutput = { query, results };
+    ctx.meter?.({ units: 1 });
     return output;
   },
 };

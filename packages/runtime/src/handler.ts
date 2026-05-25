@@ -19,6 +19,7 @@ import { checkRateLimit } from "./rate-limiter";
 import { AuditBatch } from "./audit";
 import { loadQuotaState } from "./quota";
 import { AGENT_CORE_SCHEMA } from "./constants";
+import { computeCost, recordLlmCall, recordToolInvocation } from "./metering";
 
 declare const Deno: { env: { get(name: string): string | undefined } };
 
@@ -171,6 +172,8 @@ export function createAgentHandler(opts: HandlerOptions = {}) {
     const supabase = getServiceSupabase();
 
     const claims = decodeJwtClaimsFromAuthHeader(req.headers.get("authorization"));
+    const isImpersonated = !!req.headers.get("x-agent-core-impersonate-tenant");
+    const userId: string | null = isImpersonated ? null : (claims?.sub ?? null);
     const subjectTenant = `tenant:${tenantId}`;
     const subjectUser = `user:${claims?.sub ?? "unknown"}`;
     const subjectIp = `ip:${firstForwardedIp(req)}`;
@@ -266,6 +269,7 @@ export function createAgentHandler(opts: HandlerOptions = {}) {
             tenantId,
             model: ctx.model,
             modelProvider: ctx.modelProvider,
+            userId,
             userMessage: message,
           });
 
@@ -284,16 +288,53 @@ export function createAgentHandler(opts: HandlerOptions = {}) {
             return true;
           };
 
-          const addUsage = (u: { tokensIn: number; tokensOut: number; cost: number }): boolean => {
+          const addUsage = async (
+            stepLabel: string,
+            u: { tokensIn: number; tokensOut: number; tokensCachedRead?: number; tokensCachedWrite?: number },
+            startedAt: Date,
+            finishedAt: Date,
+            error?: string
+          ): Promise<boolean> => {
+            const tokensCachedRead = u.tokensCachedRead ?? 0;
+            const tokensCachedWrite = u.tokensCachedWrite ?? 0;
+            let stepCost = 0;
+            if (supabase) {
+              const calc = await computeCost(supabase, {
+                provider: ctx.modelProvider,
+                model: ctx.model,
+                tokensIn: u.tokensIn,
+                tokensOut: u.tokensOut,
+                tokensCachedRead,
+                tokensCachedWrite,
+                at: finishedAt,
+              });
+              stepCost = calc.costUsd;
+              await recordLlmCall(supabase, {
+                runId,
+                tenantId,
+                stepLabel,
+                provider: ctx.modelProvider,
+                model: ctx.model,
+                tokensIn: u.tokensIn,
+                tokensOut: u.tokensOut,
+                tokensCachedRead,
+                tokensCachedWrite,
+                startedAt,
+                finishedAt,
+                error,
+              });
+            }
             tokensIn += u.tokensIn;
             tokensOut += u.tokensOut;
-            cost += u.cost;
+            cost += stepCost;
             return checkBudget();
           };
 
           if (!checkBudget()) return;
+          const plannedStartedAt = new Date();
           const planned = await planner(ctx, message);
-          if (!addUsage(planned.usage)) return;
+          const plannedFinishedAt = new Date();
+          if (!(await addUsage("planner", planned.usage, plannedStartedAt, plannedFinishedAt))) return;
 
           let graph: TaskGraph = planned.graph;
           if (graph.tasks.length > RUN_BUDGET.MAX_TASKS_PER_GRAPH) {
@@ -321,18 +362,40 @@ export function createAgentHandler(opts: HandlerOptions = {}) {
 
           await persistToolResults(runId, tenantId, results);
 
+          if (supabase) {
+            for (const r of results) {
+              await recordToolInvocation(supabase, {
+                runId,
+                tenantId,
+                toolKey: r.tool,
+                startedAt: r.startedAt ?? new Date(),
+                finishedAt: r.finishedAt ?? new Date(),
+                externalUnits: r.externalUnits,
+                externalCostUsd: r.externalCostUsd,
+                ok: r.ok,
+                error: r.error,
+              });
+            }
+          }
+
+          const draftedStartedAt = new Date();
           const drafted = await synthesizer(ctx, message, results);
-          if (!addUsage(drafted.usage)) return;
+          const draftedFinishedAt = new Date();
+          if (!(await addUsage("synthesizer", drafted.usage, draftedStartedAt, draftedFinishedAt))) return;
           let answer = drafted.text;
           emit({ type: "answer", text: answer });
 
+          const verdictStartedAt = new Date();
           const verdict = await critic(ctx, message, answer, results);
-          if (!addUsage(verdict.usage)) return;
+          const verdictFinishedAt = new Date();
+          if (!(await addUsage("critic", verdict.usage, verdictStartedAt, verdictFinishedAt))) return;
           emit({ type: "critic", ok: verdict.ok, notes: verdict.notes });
 
           if (!verdict.ok) {
+            const correctedStartedAt = new Date();
             const corrected = await synthesizer(ctx, `${message}\n\nVerifier feedback to address: ${verdict.notes}`, results);
-            if (!addUsage(corrected.usage)) return;
+            const correctedFinishedAt = new Date();
+            if (!(await addUsage("synthesizer", corrected.usage, correctedStartedAt, correctedFinishedAt))) return;
             answer = corrected.text;
             emit({ type: "answer", text: answer });
           }
