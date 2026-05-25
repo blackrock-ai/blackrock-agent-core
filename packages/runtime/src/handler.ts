@@ -12,7 +12,13 @@ import {
   recordRunStart,
   recordToolResults,
 } from "./persistence";
-import type { AgentResult, RunContext } from "./types";
+import type {
+  AgentResult,
+  RunContext,
+  TaskGraph,
+  ToolResult,
+  TokenUsage,
+} from "./types";
 import { authorizeRuntimeTenant } from "./auth";
 
 // Edge runtime global. The runtime targets Deno (Supabase Edge Functions).
@@ -23,6 +29,14 @@ const CORS: Record<string, string> = {
   "access-control-allow-headers": "authorization, content-type, x-agent-core-impersonate-tenant",
   "access-control-allow-methods": "POST, OPTIONS",
 };
+
+export const RUN_BUDGET = {
+  MAX_TASKS_PER_GRAPH: 20,
+  MAX_TOOL_CALLS_PER_RUN: 30,
+  MAX_TOKENS_PER_RUN: 100_000,
+  MAX_COST_PER_RUN_USD: 1.0,
+  MAX_RUN_WALL_TIME_MS: 45_000,
+} as const;
 
 const SSE_HEADERS: Record<string, string> = {
   ...CORS,
@@ -43,6 +57,21 @@ export interface HandlerOptions {
     model: string
   ) => Promise<Omit<RunContext, "registry">>;
   registry?: ToolRegistry;
+  planner?: typeof plan;
+  executor?: typeof execute;
+  synthesizer?: typeof synthesize;
+  critic?: typeof critique;
+  recordRunStart?: typeof recordRunStart;
+  recordMessage?: typeof recordMessage;
+  recordToolResults?: (runId: string, tenantId: string, results: ToolResult[]) => Promise<number>;
+  finalizeRun?: (input: {
+    runId: string;
+    tenantId: string;
+    status: "completed" | "failed";
+    usage: TokenUsage;
+    taskGraph?: TaskGraph;
+    error?: string;
+  }) => Promise<boolean>;
 }
 
 function defaultRegistry(): ToolRegistry {
@@ -106,6 +135,14 @@ function randomRunId(): string {
 export function createAgentHandler(opts: HandlerOptions = {}) {
   const customLoad = opts.loadTenantContext;
   const registry = opts.registry ?? defaultRegistry();
+  const planner = opts.planner ?? plan;
+  const executor = opts.executor ?? execute;
+  const synthesizer = opts.synthesizer ?? synthesize;
+  const critic = opts.critic ?? critique;
+  const persistRunStart = opts.recordRunStart ?? recordRunStart;
+  const persistMessage = opts.recordMessage ?? recordMessage;
+  const persistToolResults = opts.recordToolResults ?? recordToolResults;
+  const persistFinalizeRun = opts.finalizeRun ?? finalizeRun;
 
   return async (req: Request): Promise<Response> => {
     if (req.method === "OPTIONS") return new Response(null, { headers: CORS });
@@ -172,6 +209,8 @@ export function createAgentHandler(opts: HandlerOptions = {}) {
         let tokensIn = 0;
         let tokensOut = 0;
         let cost = 0;
+        let toolCallCount = 0;
+        const runStartedAt = Date.now();
         let finalGraph: AgentResult["taskGraph"] | undefined;
         let runStatus: "completed" | "failed" = "failed";
         let runError: string | undefined;
@@ -194,7 +233,7 @@ export function createAgentHandler(opts: HandlerOptions = {}) {
           // Persist the agent_runs row + the user message before any LLM
           // call. Best-effort: a persistence failure is logged but does not
           // abort the agent run.
-          await recordRunStart({
+          await persistRunStart({
             runId,
             tenantId,
             model: ctx.model,
@@ -203,23 +242,62 @@ export function createAgentHandler(opts: HandlerOptions = {}) {
           });
 
           // Per-LLM-call token accumulator.
+          const failBudget = (message: string): false => {
+            runStatus = "failed";
+            runError = message;
+            emit({ type: "error", message });
+            return false;
+          };
+
+          const checkBudget = (_reason: string): boolean => {
+            if (Date.now() - runStartedAt > RUN_BUDGET.MAX_RUN_WALL_TIME_MS) {
+              return failBudget("run budget: wall time exceeded");
+            }
+            if (toolCallCount > RUN_BUDGET.MAX_TOOL_CALLS_PER_RUN) {
+              return failBudget("run budget: too many tool calls");
+            }
+            if (tokensIn + tokensOut > RUN_BUDGET.MAX_TOKENS_PER_RUN) {
+              return failBudget("run budget: token cap exceeded");
+            }
+            if (cost > RUN_BUDGET.MAX_COST_PER_RUN_USD) {
+              return failBudget("run budget: cost cap exceeded");
+            }
+            return true;
+          };
+
+          // Per-LLM-call token accumulator.
           const addUsage = (u: {
             tokensIn: number;
             tokensOut: number;
             cost: number;
-          }) => {
+          }): boolean => {
             tokensIn += u.tokensIn;
             tokensOut += u.tokensOut;
             cost += u.cost;
+            return checkBudget("add_usage");
           };
 
           // 2. Plan.
-          const planned = await plan(ctx, message);
-          addUsage(planned.usage);
-          const graph = planned.graph;
+          if (!checkBudget("before_planner")) return;
+          const planned = await planner(ctx, message);
+          if (!addUsage(planned.usage)) return;
+
+          let graph: TaskGraph = planned.graph;
+          const plannedTaskCount = planned.graph.tasks.length;
+          if (plannedTaskCount > RUN_BUDGET.MAX_TASKS_PER_GRAPH) {
+            graph = {
+              ...planned.graph,
+              tasks: planned.graph.tasks.slice(0, RUN_BUDGET.MAX_TASKS_PER_GRAPH),
+            };
+            emit({
+              type: "plan_truncated",
+              original: plannedTaskCount,
+              kept: RUN_BUDGET.MAX_TASKS_PER_GRAPH,
+            });
+          }
           finalGraph = graph;
           emit({ type: "plan", graph });
-          await recordMessage({
+          await persistMessage({
             runId,
             tenantId,
             role: "assistant",
@@ -227,15 +305,25 @@ export function createAgentHandler(opts: HandlerOptions = {}) {
           });
 
           // 3. Execute tools — executor emits tool_start / tool_end per task.
-          const results = await execute(ctx, graph, { onEvent: emit });
-          await recordToolResults(runId, tenantId, results);
+          if (!checkBudget("before_execute")) return;
+          const results = await executor(ctx, graph, {
+            onEvent: emit,
+            onWaveComplete: (completedCount) => {
+              toolCallCount = completedCount;
+              return checkBudget("tool_wave");
+            },
+          });
+          if (runStatus === "failed") return;
+          if (!checkBudget("after_execute")) return;
+          await persistToolResults(runId, tenantId, results);
 
           // 4. Synthesize a draft answer.
-          const drafted = await synthesize(ctx, message, results);
-          addUsage(drafted.usage);
+          if (!checkBudget("before_synthesize")) return;
+          const drafted = await synthesizer(ctx, message, results);
+          if (!addUsage(drafted.usage)) return;
           let answer = drafted.text;
           emit({ type: "answer", text: answer });
-          await recordMessage({
+          await persistMessage({
             runId,
             tenantId,
             role: "assistant",
@@ -243,14 +331,15 @@ export function createAgentHandler(opts: HandlerOptions = {}) {
           });
 
           // 5. Critic pass — optionally correct once against verifier feedback.
-          const verdict = await critique(ctx, message, answer, results);
-          addUsage(verdict.usage);
+          if (!checkBudget("before_critic")) return;
+          const verdict = await critic(ctx, message, answer, results);
+          if (!addUsage(verdict.usage)) return;
           emit({
             type: "critic",
             ok: verdict.ok,
             notes: verdict.notes,
           });
-          await recordMessage({
+          await persistMessage({
             runId,
             tenantId,
             role: "assistant",
@@ -263,15 +352,16 @@ export function createAgentHandler(opts: HandlerOptions = {}) {
           });
 
           if (!verdict.ok) {
-            const corrected = await synthesize(
+            if (!checkBudget("before_corrective_synthesize")) return;
+            const corrected = await synthesizer(
               ctx,
               `${message}\n\nVerifier feedback to address: ${verdict.notes}`,
               results
             );
-            addUsage(corrected.usage);
+            if (!addUsage(corrected.usage)) return;
             answer = corrected.text;
             emit({ type: "answer", text: answer });
-            await recordMessage({
+            await persistMessage({
               runId,
               tenantId,
               role: "assistant",
@@ -291,7 +381,16 @@ export function createAgentHandler(opts: HandlerOptions = {}) {
             results,
             usage: { tokensIn, tokensOut, cost },
           };
-          emit({ type: "final", result });
+          emit({
+            type: "final",
+            result,
+            budget_used: {
+              tokens: tokensIn + tokensOut,
+              cost,
+              tool_calls: toolCallCount,
+              duration_ms: Date.now() - runStartedAt,
+            },
+          });
           runStatus = "completed";
         } catch (e) {
           // Log the full error server-side; emit a sanitized message to the
@@ -305,7 +404,7 @@ export function createAgentHandler(opts: HandlerOptions = {}) {
           // Best-effort terminal update — fires even if the try threw before
           // ctx was resolved, so the agent_runs row always lands in a
           // terminal state instead of being stuck in 'running'.
-          await finalizeRun({
+          await persistFinalizeRun({
             runId,
             tenantId,
             status: runStatus,

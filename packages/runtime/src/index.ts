@@ -1,4 +1,4 @@
-export { createAgentHandler } from "./handler";
+export { createAgentHandler, RUN_BUDGET } from "./handler";
 export type { HandlerOptions } from "./handler";
 export { loadTenantContext } from "./context";
 export { plan } from "./planner";

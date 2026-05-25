@@ -9,6 +9,7 @@ import type { AgentResult, TaskGraph, ToolResult } from "./types";
 export type AgentEvent =
   | { type: "start"; runId: string; tenantId: string }
   | { type: "plan"; graph: TaskGraph }
+  | { type: "plan_truncated"; original: number; kept: number }
   | {
       type: "tool_start";
       taskId: string;
@@ -25,7 +26,16 @@ export type AgentEvent =
     }
   | { type: "answer"; text: string }
   | { type: "critic"; ok: boolean; notes: string }
-  | { type: "final"; result: AgentResult }
+  | {
+      type: "final";
+      result: AgentResult;
+      budget_used?: {
+        tokens: number;
+        cost: number;
+        tool_calls: number;
+        duration_ms: number;
+      };
+    }
   | { type: "error"; message: string };
 
 export type AgentEventType = AgentEvent["type"];

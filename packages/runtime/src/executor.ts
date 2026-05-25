@@ -10,6 +10,11 @@ export interface ExecuteOptions {
    * the run.
    */
   onEvent?: (event: AgentEvent) => void | Promise<void>;
+  /**
+   * Called after each dependency wave with the total completed count.
+   * Return false to stop executing additional waves.
+   */
+  onWaveComplete?: (completedCount: number) => boolean | void | Promise<boolean | void>;
 }
 
 /**
@@ -107,6 +112,11 @@ export async function execute(
       }
     }
     for (const t of ready) remaining.splice(remaining.indexOf(t), 1);
+
+    if (opts.onWaveComplete) {
+      const shouldContinue = await opts.onWaveComplete(done.size);
+      if (shouldContinue === false) break;
+    }
   }
 
   return graph.tasks.map(
